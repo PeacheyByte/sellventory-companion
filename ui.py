@@ -35,13 +35,13 @@ CARD_W = 260
 
 LIB_DIR = os.path.join(APP_DIR, "library")
 
-PALETTE_LIGHT = {"bg":"#ffffff","fg":"#111111","muted":"#555555","card":"#f2f2f2","border":"#d0d0d0"}
-PALETTE_DARK  = {"bg":"#141414","fg":"#eaeaea","muted":"#b0b0b0","card":"#242424","border":"#2c2c2c"}
+PALETTE_LIGHT = {"bg":"#ffffff","fg":"#111111","muted":"#555555","card":"#f2f2f2","border":"#d0d0d0","sel":"#dfe8ff"}
+PALETTE_DARK  = {"bg":"#141414","fg":"#eaeaea","muted":"#b0b0b0","card":"#242424","border":"#2c2c2c","sel":"#22304d"}
 
 class SellventoryApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Sellventory Companion")
+        self.root.title("The Collection Curator Companion")
         self.root.geometry("1180x760")
         self.root.minsize(1000, 640)
 
@@ -58,11 +58,19 @@ class SellventoryApp:
         self.items = []
         self.filtered = []
         self.view_mode = tk.StringVar(value="gallery")
-        self.thumb_cache = {}
 
+        # right-pane (editor) zoom
         self._zoom = 1.0
         self._prev_w = BASE_PREV_W
         self._prev_h = BASE_PREV_H
+
+        # --- Gallery state ---
+        self._gscale = 1.0                        # gallery zoom
+        self.gallery_selection: set[int] = set()  # selected local_ids
+        self._gallery_anchor: int|None = None     # for Shift+click range
+        self._gallery_order: list[int] = []       # render order of local_ids
+        self.gallery_card_frames: dict[int, ttk.Frame] = {}  # lid -> frame
+        self.thumb_cache = {}
 
         ensure_app_dir()
         os.makedirs(LIB_DIR, exist_ok=True)
@@ -145,7 +153,13 @@ class SellventoryApp:
         ttk.Label(bar, text="Tag:").pack(side="left")
         self.tag_var = tk.StringVar(value="All")
         self.tag_cb = ttk.Combobox(bar, textvariable=self.tag_var, state="readonly", width=18)
-        self.tag_cb.pack(side="left")
+        self.tag_cb.pack(side="left", padx=(0,10))
+
+        # --- Gallery Zoom controls (affect only the gallery) ---
+        ttk.Label(bar, text="Zoom:").pack(side="left")
+        ttk.Button(bar, text="−", width=2, command=lambda:self._gallery_zoom_change(-0.1)).pack(side="left")
+        ttk.Button(bar, text="Reset", command=self._gallery_zoom_reset).pack(side="left", padx=2)
+        ttk.Button(bar, text="+", width=2, command=lambda:self._gallery_zoom_change(+0.1)).pack(side="left")
 
         self.search_var.trace_add("write", lambda *_: self.apply_filters())
         self.storage_cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_filters())
@@ -195,6 +209,14 @@ class SellventoryApp:
         self.gallery_inner.bind("<Configure>", lambda _e: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all")))
         self.gallery_wrap.bind("<Configure>", lambda _e: self._render_view())
 
+        # Ctrl + wheel zoom (Windows/macOS delta) & Linux buttons 4/5
+        self.gallery_canvas.bind("<Control-MouseWheel>", self._on_gallery_wheel_delta)
+        self.gallery_canvas.bind("<Control-Button-4>",  lambda e: self._gallery_zoom_change(+0.1))
+        self.gallery_canvas.bind("<Control-Button-5>",  lambda e: self._gallery_zoom_change(-0.1))
+        # Ctrl +/- keys when canvas focused
+        self.gallery_canvas.bind_all("<Control-=>", lambda e: self._gallery_zoom_change(+0.1))
+        self.gallery_canvas.bind_all("<Control-minus>", lambda e: self._gallery_zoom_change(-0.1))
+
         # Right host (editor / dashboard)
         self.editor_host = ttk.Frame(self.right_wrap, padding=(0,0,0,0))
         self.editor_host.grid(row=0, column=0, sticky="nsew")
@@ -211,6 +233,7 @@ class SellventoryApp:
         self.style.configure("TLabel", background=bg, foreground=fg)
         self.style.configure("TButton", foreground=fg)
         self.style.configure("Card.TFrame", relief="groove", background=self.palette["card"])
+        self.style.configure("CardSelected.TFrame", relief="groove", background=self.palette["sel"])
 
         self.gallery_canvas.configure(bg=bg)
         self.style.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg)
@@ -271,8 +294,8 @@ class SellventoryApp:
                 it.get("local_id"), it.get("title",""), it.get("description",""), it.get("storage",""),
                 it.get("dateBought",""),
                 (it.get("boughtPriceCents") or 0)/100.0,
-                (it.get("salePriceCents")/100.0) if it.get("salePriceCents") is not None else None,
-                (it.get("soldPriceCents")/100.0) if it.get("soldPriceCents") is not None else None,
+                (it.get("salePriceCents") or 0)/100.0 if it.get("salePriceCents") is not None else None,
+                (it.get("soldPriceCents") or 0)/100.0 if it.get("soldPriceCents") is not None else None,
                 it.get("soldDate",""), it.get("tags",""), it.get("image_name",""),
             ])
         wb.save(path)
@@ -327,6 +350,8 @@ class SellventoryApp:
         else:
             self.gallery_wrap.grid(row=0, column=0, sticky="nsew")
             self._render_gallery()
+            # ensure wheel/keys go to gallery
+            self.gallery_canvas.focus_set()
 
     def _render_list(self):
         self.tree.delete(*self.tree.get_children())
@@ -343,33 +368,134 @@ class SellventoryApp:
             self.tree.selection_set(kids[0]); self.tree.see(kids[0])
 
     def _render_gallery(self):
+        # remember selection & order
+        current_sel = set(self.gallery_selection)
+
         for w in self.gallery_inner.winfo_children(): w.destroy()
-        wrap_w = self.gallery_wrap.winfo_width() or self.root.winfo_width()
-        cols = max(1, wrap_w // (CARD_W + 20))
+        self.gallery_card_frames.clear()
+        self._gallery_order = [int(it['local_id']) for it in self.filtered]
+
+        tw, th = int(THUMB_W*self._gscale), int(THUMB_H*self._gscale)
+        card_w = int(max(tw + 100, CARD_W * self._gscale))
+        wrap_w = max(1, self.gallery_wrap.winfo_width() or self.root.winfo_width())
+        cols = max(1, wrap_w // (card_w + 20))
 
         def open_inline(local_id, _e=None):
-            # stay in Gallery; just update right-side editor
             self._open_inline_editor_by_id(local_id)
 
+        def click_handler(lid):
+            def _on_click(e):
+                # Cross-platform modifier masks (Tk): Shift=0x0001, Control=0x0004
+                ctrl  = bool(e.state & 0x0004)
+                shift = bool(e.state & 0x0001)
+                if shift and self._gallery_anchor in self._gallery_order:
+                    self._gallery_select_range(self._gallery_anchor, lid)
+                elif ctrl:
+                    self._gallery_toggle(lid)
+                    if self._gallery_anchor is None:
+                        self._gallery_anchor = lid
+                else:
+                    self._gallery_select_only(lid)
+                    self._gallery_anchor = lid
+            return _on_click
+
         for idx, it in enumerate(self.filtered):
+            lid = int(it['local_id'])
             r, c = divmod(idx, cols)
             frame = ttk.Frame(self.gallery_inner, style="Card.TFrame", padding=6)
             frame.grid(row=r, column=c, padx=8, pady=8, sticky="n")
 
-            cnv = tk.Canvas(frame, width=THUMB_W, height=THUMB_H,
+            cnv = tk.Canvas(frame, width=tw, height=th,
                             highlightthickness=1, bg=self.palette["bg"], highlightbackground=self.palette["border"])
             cnv.grid(row=0, column=0, sticky="n")
-            img = self._thumb_for(it)
-            if img: cnv.create_image(THUMB_W//2, THUMB_H//2, image=img, anchor="center")
-            else:   cnv.create_text(THUMB_W//2, THUMB_H//2, text="(no image)", fill=self.palette["muted"])
+            img = self._thumb_for(it, tw, th)
+            if img: cnv.create_image(tw//2, th//2, image=img, anchor="center")
+            else:   cnv.create_text(tw//2, th//2, text="(no image)", fill=self.palette["muted"])
 
-            ttk.Label(frame, text=f"{it['local_id']} - {it.get('title','')}").grid(row=1, column=0, sticky="w", pady=(6,0))
-            ttk.Label(frame, text=it.get("storage",""), foreground=self.palette["muted"]).grid(row=2, column=0, sticky="w")
+            lab_title = ttk.Label(frame, text=f"{lid} - {it.get('title','')}")
+            lab_title.grid(row=1, column=0, sticky="w", pady=(6,0))
+            lab_loc = ttk.Label(frame, text=it.get("storage",""), foreground=self.palette["muted"])
+            lab_loc.grid(row=2, column=0, sticky="w")
 
-            frame.bind("<Double-1>", lambda e, lid=it['local_id']: open_inline(lid))
-            cnv.bind("<Double-1>",  lambda e, lid=it['local_id']: open_inline(lid))
+            # clicks & double-click to open editor
+            for w in (frame, cnv, lab_title, lab_loc):
+                w.bind("<Button-1>", click_handler(lid))
+                w.bind("<Double-1>", lambda e, L=lid: open_inline(L))
+                try: w.configure(cursor="hand2")
+                except Exception: pass
 
-    # --------- selection helpers ---------
+            self.gallery_card_frames[lid] = frame
+
+        # restore selection and styles
+        if current_sel:
+            self.gallery_selection = {lid for lid in current_sel if lid in self._gallery_order}
+        self._update_gallery_selection_styles()
+        if len(self.gallery_selection) == 1:
+            self._open_inline_editor_by_id(next(iter(self.gallery_selection)))
+        elif len(self.gallery_selection) == 0:
+            self._clear_editor()
+        else:
+            self._show_multi_selected_summary()
+
+    # ---- Gallery selection helpers ----
+    def _gallery_select_only(self, lid:int):
+        self.gallery_selection = {lid}
+        self._update_gallery_selection_styles()
+        self._open_inline_editor_by_id(lid)
+
+    def _gallery_toggle(self, lid:int):
+        if lid in self.gallery_selection:
+            self.gallery_selection.remove(lid)
+        else:
+            self.gallery_selection.add(lid)
+        self._update_gallery_selection_styles()
+        if len(self.gallery_selection)==1:
+            self._open_inline_editor_by_id(next(iter(self.gallery_selection)))
+        elif len(self.gallery_selection)==0:
+            self._clear_editor()
+        else:
+            self._show_multi_selected_summary()
+
+    def _gallery_select_range(self, anchor:int|None, lid:int):
+        if anchor is None:
+            self._gallery_select_only(lid); return
+        try:
+            i1 = self._gallery_order.index(anchor)
+            i2 = self._gallery_order.index(lid)
+        except ValueError:
+            self._gallery_select_only(lid); return
+        lo, hi = sorted((i1, i2))
+        self.gallery_selection = set(self._gallery_order[lo:hi+1])
+        self._update_gallery_selection_styles()
+        if len(self.gallery_selection)==1:
+            self._open_inline_editor_by_id(lid)
+        else:
+            self._show_multi_selected_summary()
+
+    def _update_gallery_selection_styles(self):
+        for lid, frame in self.gallery_card_frames.items():
+            frame.configure(style="CardSelected.TFrame" if lid in self.gallery_selection else "Card.TFrame")
+
+    def _show_multi_selected_summary(self):
+        self._clear_editor()
+        frm = ttk.Frame(self.editor_host); frm.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(frm, text=f"{len(self.gallery_selection)} items selected").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(frm, text="(Bulk edit not implemented in this build)").grid(row=1, column=0, sticky="w", padx=6)
+
+    # ---- Gallery zoom helpers ----
+    def _gallery_zoom_change(self, delta:float):
+        self._gscale = max(0.6, min(2.2, self._gscale + delta))
+        self._render_gallery()
+
+    def _gallery_zoom_reset(self):
+        self._gscale = 1.0
+        self._render_gallery()
+
+    def _on_gallery_wheel_delta(self, e):
+        if e.delta > 0: self._gallery_zoom_change(+0.1)
+        elif e.delta < 0: self._gallery_zoom_change(-0.1)
+
+    # --------- List selection handlers ---------
     def _on_tree_select(self, _evt):
         self._update_editor_selection()
 
@@ -388,7 +514,7 @@ class SellventoryApp:
             return
         self._open_inline_editor_by_id(lid)
 
-    # ---------------- Inline Editor (VERTICAL: image on top, fields below) ----------------
+    # ---------------- Inline Editor ----------------
     def _clear_editor(self):
         for w in self.editor_host.winfo_children():
             w.destroy()
@@ -404,9 +530,8 @@ class SellventoryApp:
         self._clear_editor()
         editor = ttk.Frame(self.editor_host)
         editor.grid(row=0, column=0, sticky="nsew")
-        editor.columnconfigure(0, weight=1)   # single column layout
+        editor.columnconfigure(0, weight=1)
 
-        # top tools row
         tools = ttk.Frame(editor)
         tools.grid(row=0, column=0, sticky="ew", pady=(0,6))
         ttk.Label(tools, text="Details").pack(side="left")
@@ -414,14 +539,12 @@ class SellventoryApp:
         ttk.Button(tools, text="Reset", command=lambda:self._zoom_reset(editor, it)).pack(side="left", padx=2)
         ttk.Button(tools, text="+", width=3, command=lambda:self._zoom_change(+0.1, editor, it)).pack(side="left", padx=2)
 
-        # image block
         img_frame = ttk.Frame(editor)
         img_frame.grid(row=1, column=0, sticky="n", padx=(0,0))
         self.preview = tk.Canvas(img_frame, width=self._prev_w, height=self._prev_h, highlightthickness=1)
         self.preview.grid(row=0, column=0, sticky="n")
         self._render_preview_image(it)
 
-        # fields block (BELOW image)
         fields = ttk.Frame(editor)
         fields.grid(row=2, column=0, sticky="nsew", pady=(8,0))
         fields.columnconfigure(1, weight=1)
@@ -921,8 +1044,7 @@ class SellventoryApp:
         try: return f"${cents/100:.2f}"
         except Exception: return ""
 
-    # Column sorting for list view
-    _sort_states = {}  # col -> bool
+    _sort_states = {}
     def _sort_by(self, col):
         rev = self._sort_states.get(col, False)
         self._sort_states[col] = not rev
@@ -940,10 +1062,6 @@ class SellventoryApp:
                 y,m,d = map(int, s.split("-")); return dt.date(y,m,d)
             except: return dt.date.min
 
-        idx_map = {
-            "local_id":0, "title":1, "storage":2, "dateBought":3,
-            "boughtPrice":4, "salePrice":5, "soldPrice":6, "soldDate":7
-        }
         rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
         if col in ("local_id",):
             rows.sort(key=lambda t: int(t[0]) if str(t[0]).isdigit() else -1, reverse=rev)
