@@ -1,4 +1,4 @@
-name: Build Sellventory Companion
+name: Build TCC Companion
 
 on:
   workflow_dispatch: {}   # allows manual Run
@@ -15,11 +15,11 @@ jobs:
           python-version: '3.11'
       - run: pip install --upgrade pip
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller -F -w ui.py -n sellventory.exe
+      - run: pyinstaller -F -w main.py -n TCC-Companion.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: sellventory-windows
-          path: dist/sellventory.exe
+          name: TCC-Companion-win64
+          path: dist/TCC-Companion.exe
 
   linux:
     runs-on: ubuntu-latest
@@ -30,8 +30,8 @@ jobs:
           python-version: '3.11'
       - run: pip install --upgrade pip
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller -F ui.py -n sellventory
+      - run: pyinstaller -F main.py -n TCC-Companion
       - uses: actions/upload-artifact@v4
         with:
-          name: sellventory-linux
-          path: dist/sellventory
+          name: TCC-Companion-linux64
+          path: dist/TCC-Companion
