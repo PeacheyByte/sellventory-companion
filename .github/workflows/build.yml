@@ -1,3 +1,10 @@
+name: Build TCC Companion
+
+on:
+  workflow_dispatch: {}   # allows manual Run
+  push:
+    branches: [ main ]    # builds on pushes to main
+
 jobs:
   windows:
     runs-on: windows-latest
